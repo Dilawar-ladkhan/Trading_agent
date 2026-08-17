@@ -10,6 +10,32 @@ from datetime import datetime, timedelta, timezone
 import os, json, requests, warnings, logging
 import pandas as pd
 import ta
+import json as json_lib
+from pathlib import Path
+
+TRADE_LOG_FILE = "trade_history.json"
+COOLDOWN_CYCLES = 3  # number of recent runs a symbol stays "cooling down" after a trade
+
+def load_trade_history():
+    if Path(TRADE_LOG_FILE).exists():
+        with open(TRADE_LOG_FILE) as f:
+            return json_lib.load(f)
+    return []
+
+def save_trade(symbol, action):
+    history = load_trade_history()
+    history.append({
+        "symbol": symbol,
+        "action": action,
+        "timestamp": datetime.now(timezone.utc).isoformat()
+    })
+    with open(TRADE_LOG_FILE, "w") as f:
+        json_lib.dump(history[-50:], f, indent=2)  # keep last 50 trades only
+
+def recently_traded(symbol):
+    history = load_trade_history()
+    recent = history[-COOLDOWN_CYCLES:]
+    return any(t["symbol"] == symbol for t in recent)
 
 warnings.filterwarnings("ignore")
 logging.getLogger("urllib3").setLevel(logging.ERROR)
@@ -203,19 +229,18 @@ trade_tool = {
     "type": "function",
     "function": {
         "name": "make_trade_decisions",
-        "description": "Decide on a set of trade actions (buy/sell/hold) across multiple symbols based on full portfolio state, technicals, and news. You can return multiple decisions in one call.",
+        "description": "Decide on a set of trade actions across multiple symbols.",
         "parameters": {
             "type": "object",
             "properties": {
                 "decisions": {
                     "type": "array",
-                    "description": "List of trade decisions, one per symbol you want to act on. Only include symbols you want to buy or sell — no need to list holds.",
                     "items": {
                         "type": "object",
                         "properties": {
-                            "symbol": {"type": "string", "enum": allowed_symbols},
+                            "symbol": {"type": "string", "enum": symbols},
                             "action": {"type": "string", "enum": ["buy", "sell"]},
-                            "reasoning": {"type": "string", "description": "Why this action for this symbol"}
+                            "reasoning": {"type": "string"}
                         },
                         "required": ["symbol", "action", "reasoning"]
                     }
@@ -252,6 +277,7 @@ not just scanning for new buys. You may take multiple actions this cycle if warr
 sell a losing position AND buy a strong opportunity in the same response. Only include symbols
 you want to act on (buy or sell); omit anything you want to hold.
 
+Current allocation: {current_allocation:.1f}% — {'❌ HARD BLOCKED: DO NOT propose buying this symbol, you are already at the maximum allocation' if at_limit else 'OK to buy'}
 Use the make_trade_decisions tool to respond."""
 
 response = client.chat.completions.create(
@@ -261,7 +287,17 @@ response = client.chat.completions.create(
     temperature=0.3,
 )
 
+
 message = response.choices[0].message
+
+def normalize_symbol(raw_symbol, valid_symbols):
+    """Map a possibly-malformed symbol (e.g. 'BTCUSD') back to the canonical form ('BTC/USD')."""
+    cleaned = raw_symbol.replace("/", "").replace("-", "").upper()
+    for s in valid_symbols:
+        if s.replace("/", "").upper() == cleaned:
+            return s
+    return None  # no match found
+
 if message.tool_calls:
     result = json.loads(message.tool_calls[0].function.arguments)
     decisions = result.get("decisions", [])
@@ -270,8 +306,18 @@ if message.tool_calls:
         print("⏸️  No actions — holding across the board.")
 
     for decision in decisions:
-        symbol = decision["symbol"]
+        raw_symbol = decision["symbol"]
+        symbol = normalize_symbol(raw_symbol, symbols)
         action = decision["action"]
+
+        if symbol is None:
+            print(f"⚠️ Unrecognized symbol from LLM: {raw_symbol} — skipping.")
+            continue
+
+        if recently_traded(symbol):
+            print(f"⏳ Skipping {symbol} — recently traded, in cooldown to avoid whipsaw.")
+            continue
+
         print(f"\nSymbol: {symbol}")
         print(f"Action: {action}")
         print(f"Reasoning: {decision['reasoning']}")
@@ -294,5 +340,6 @@ if message.tool_calls:
 
         order = trading_client.submit_order(order_request)
         print(f"✅ Order placed: {action.upper()} {symbol} — status: {order.status}")
+        save_trade(symbol, action)
 else:
     print("No tool call made. Raw response:", message.content)
